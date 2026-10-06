@@ -1,0 +1,10 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {Simulation,project,angularMeasurement,seededRandom,detectSpots} from '../public/simulation-engine.mjs';
+const config={seed:26169,scene:'orbital',fov:8,speed:.55,targets:3,turbulence:0,vibration:0,noise:5,blur:0,decoys:true,gain:1};
+test('camera projection and inverse agree across pan, tilt and FOV',()=>{const camera={az:2,el:-1};for(const fov of [3,8,14]){const p=project(2.8,-.7,camera,fov),m=angularMeasurement(p.x,p.y,camera,fov);assert.ok(Math.abs(m.az-2.8)<1e-8);assert.ok(Math.abs(m.el+.7)<1e-8);}});
+test('seeded randomness is reproducible',()=>{const a=seededRandom(26169),b=seededRandom(26169);assert.deepEqual(Array.from({length:100},a),Array.from({length:100},b));});
+test('empty sensor never invents a detection',()=>{assert.equal(detectSpots(new Uint8Array(320*240)).length,0);});
+test('temporal signature selects the designated beacon despite brighter decoys',()=>{const s=new Simulation(config);let f;for(let i=0;i<210;i++)f=s.step();assert.equal(f.state,'TRACK');assert.ok(f.confidence>.7);assert.ok(f.metrics.retention>60);assert.ok(f.sample.error<.2);assert.ok(f.metrics.acquisition<2);});
+test('dropout enters recovery and reacquires without hiding the loss',()=>{const s=new Simulation(config);for(let i=0;i<100;i++)s.step();s.injectDropout(2);const states=[];let f;for(let i=0;i<180;i++){f=s.step();states.push(f.state);}assert.ok(states.includes('COAST'));assert.ok(states.includes('REACQUIRE'));assert.equal(f.state,'TRACK');assert.ok(f.metrics.losses>=1);assert.ok(f.metrics.reacquisition>0);assert.ok(f.metrics.availability<100);});
+test('matching seeds replay identical sensor observations',()=>{const a=new Simulation(config),b=new Simulation(config);for(let i=0;i<5;i++){const x=a.step(),y=b.step();assert.deepEqual(new Uint8Array(x.pixels),new Uint8Array(y.pixels));assert.deepEqual(x.camera,y.camera);}});

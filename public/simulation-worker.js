@@ -1,0 +1,5 @@
+import {Simulation} from './simulation-engine.mjs';
+let simulation=null,timer=null,startTime=0,wallFrames=0;
+function emit(){if(!simulation)return;const frame=simulation.step();wallFrames++;const elapsed=(performance.now()-startTime)/1000;if(elapsed>0)frame.metrics.fps=wallFrames/elapsed;self.postMessage(frame,[frame.pixels]);}
+function stop(){if(timer){clearInterval(timer);timer=null;}}
+self.onmessage=({data})=>{try{switch(data.type){case 'init':stop();simulation=new Simulation(data.config);startTime=performance.now();wallFrames=0;emit();break;case 'start':if(!timer){startTime=performance.now();wallFrames=0;timer=setInterval(emit,1000/30);}break;case 'pause':stop();break;case 'reset':stop();simulation=new Simulation(data.config);startTime=performance.now();wallFrames=0;emit();break;case 'config':simulation?.setConfig(data.config);break;case 'dropout':simulation?.injectDropout(data.seconds);break;}}catch(error){stop();self.postMessage({type:'error',message:error instanceof Error?error.message:String(error)});}};
