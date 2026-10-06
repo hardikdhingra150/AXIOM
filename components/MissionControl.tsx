@@ -58,6 +58,7 @@ import {
 } from '@/lib/types';
 import Chart from './Chart';
 import { useRunLibrary } from '@/hooks/useRunLibrary';
+import { useSimulation } from '@/hooks/useSimulation';
 import { exportFile, exportRun, type ExportFormat } from '@/lib/exports';
 const OrbitalScene = dynamic(() => import('./OrbitalScene'), {
   ssr: false,
@@ -164,11 +165,6 @@ function StatePill({ state, running }: { state: string; running: boolean }) {
 }
 export default function MissionControl() {
   const [tab, setTab] = useState<Tab>('mission'),
-    [config, setConfig] = useState<Config>(DEFAULT_CONFIG),
-    [running, setRunning] = useState(false),
-    [frame, setFrame] = useState<Frame | null>(null),
-    [samples, setSamples] = useState<Sample[]>([]),
-    [events, setEvents] = useState<Frame['events']>([]),
     [toast, setToast] = useState(''),
     [exportOpen, setExportOpen] = useState(false),
     [selectedRun, setSelectedRun] = useState<SavedRun | null>(null),
@@ -177,24 +173,55 @@ export default function MissionControl() {
     [demoStage, setDemoStage] = useState(0),
     [recording, setRecording] = useState(false),
     [recordSeconds, setRecordSeconds] = useState(0),
-    [ready, setReady] = useState(false),
     [confirmClear, setConfirmClear] = useState(false),
     [inspectTruth, setInspectTruth] = useState(false);
-  const worker = useRef<Worker | null>(null),
-    frameRef = useRef<Frame | null>(null),
-    sensor = useRef<HTMLCanvasElement>(null),
-    samplesRef = useRef<Sample[]>([]),
-    eventsRef = useRef<Frame['events']>([]),
-    configRef = useRef(config),
-    initialConfigRef = useRef<Config>(DEFAULT_CONFIG),
-    lastUpdate = useRef(0),
-    lastSample = useRef(0),
+  const sensor = useRef<HTMLCanvasElement>(null),
     demoDone = useRef(new Set<number>()),
     recorder = useRef<MediaRecorder | null>(null),
     streamRef = useRef<MediaStream | null>(null),
     recordStart = useRef(0);
   const notify = useCallback((t: string) => setToast(t), []);
   const { runs, addRun, clearRuns, loadError } = useRunLibrary();
+  const {
+    config,
+    setConfig,
+    configRef,
+    initialConfigRef,
+    running,
+    ready,
+    frame,
+    frameRef,
+    samples,
+    samplesRef,
+    events,
+    eventsRef,
+    start,
+    pause,
+    reset: resetSimulation,
+    injectDropout,
+  } = useSimulation({
+    onFrame: (nextFrame) => {
+      const ctx = sensor.current?.getContext('2d');
+      if (!ctx) return;
+      ctx.putImageData(
+        new ImageData(
+          new Uint8ClampedArray(nextFrame.pixels),
+          nextFrame.width,
+          nextFrame.height,
+        ),
+        0,
+        0,
+      );
+      drawSensor(ctx, nextFrame);
+    },
+    onError: notify,
+  });
+
+  useEffect(() => {
+    return () => {
+      streamRef.current?.getTracks().forEach((track) => track.stop());
+    };
+  }, []);
 
   useEffect(() => {
     if (loadError) notify(loadError);
@@ -207,76 +234,6 @@ export default function MissionControl() {
     const timer = setTimeout(() => setToast(''), 4500);
     return () => clearTimeout(timer);
   }, [toast]);
-  useEffect(() => {
-    configRef.current = config;
-    worker.current?.postMessage({ type: 'config', config });
-    try {
-      localStorage.setItem('archis-config-v1', JSON.stringify(config));
-    } catch {}
-  }, [config]);
-  useEffect(() => {
-    let initial = DEFAULT_CONFIG;
-    try {
-      const c = JSON.parse(localStorage.getItem('archis-config-v1') || 'null');
-      if (
-        c &&
-        SCENES.some((x) => x.id === c.scene) &&
-        Number.isFinite(c.seed) &&
-        c.fov >= 2 &&
-        c.fov <= 16
-      )
-        initial = { ...DEFAULT_CONFIG, ...c };
-    } catch {}
-    setConfig(initial);
-    initialConfigRef.current = { ...initial };
-    const w = new Worker('/simulation-worker.js', { type: 'module' });
-    worker.current = w;
-    w.onmessage = ({ data }) => {
-      if (data.type === 'error') {
-        notify(`Simulation stopped: ${data.message}`);
-        setRunning(false);
-        return;
-      }
-      const f = data as Frame;
-      frameRef.current = f;
-      const canvas = sensor.current;
-      if (canvas) {
-        const ctx = canvas.getContext('2d');
-        if (ctx) {
-          ctx.putImageData(
-            new ImageData(new Uint8ClampedArray(f.pixels), f.width, f.height),
-            0,
-            0,
-          );
-          drawSensor(ctx, f);
-        }
-      }
-      if (f.events.length) {
-        eventsRef.current = [...eventsRef.current, ...f.events].slice(-500);
-        setEvents([...eventsRef.current]);
-      }
-      if (f.sample.t - lastSample.current >= 0.2 || samplesRef.current.length === 0) {
-        samplesRef.current.push(f.sample);
-        if (samplesRef.current.length > 18000) samplesRef.current.shift();
-        lastSample.current = f.sample.t;
-      }
-      if (performance.now() - lastUpdate.current > 110) {
-        lastUpdate.current = performance.now();
-        setFrame(f);
-        setSamples(samplesRef.current.slice(-180));
-      }
-    };
-    w.onerror = () => {
-      setRunning(false);
-      notify('The simulation worker could not start. Reload this page to retry.');
-    };
-    w.postMessage({ type: 'init', config: initial });
-    setReady(true);
-    return () => {
-      w.terminate();
-      streamRef.current?.getTracks().forEach((t) => t.stop());
-    };
-  }, [notify]);
   useEffect(() => {
     if (tab === 'mission' && frameRef.current && sensor.current) {
       const f = frameRef.current,
@@ -329,26 +286,8 @@ export default function MissionControl() {
   }, [exportOpen, confirmClear]);
   const update = (key: keyof Config, value: Config[keyof Config]) =>
     setConfig((c) => ({ ...c, [key]: value }));
-  const start = () => {
-    if (!ready) return;
-    worker.current?.postMessage({ type: 'start' });
-    setRunning(true);
-  };
-  const pause = () => {
-    worker.current?.postMessage({ type: 'pause' });
-    setRunning(false);
-  };
   const reset = (c: Config = configRef.current) => {
-    initialConfigRef.current = { ...c };
-    worker.current?.postMessage({ type: 'reset', config: c });
-    setRunning(false);
-    samplesRef.current = [];
-    eventsRef.current = [];
-    lastSample.current = 0;
-    setSamples([]);
-    setEvents([]);
-    setFrame(null);
-    frameRef.current = null;
+    resetSimulation(c);
     setGuided(false);
     demoDone.current.clear();
   };
@@ -427,19 +366,18 @@ export default function MissionControl() {
             vibration: 35,
             noise: 22,
           }));
-        if (i === 3) worker.current?.postMessage({ type: 'dropout', seconds: 2.5 });
+        if (i === 3) injectDropout(2.5);
         if (i === 4)
           setConfig((c) => ({ ...c, turbulence: 12, vibration: 8, noise: 12 }));
         if (i === 5) {
-          worker.current?.postMessage({ type: 'pause' });
-          setRunning(false);
+          pause();
           setGuided(false);
           saveRun();
           notify('Guided run complete. Export its report or replay from the library.');
         }
       }
     }
-  }, [frame, guided, running, saveRun, notify]);
+  }, [frame, guided, running, saveRun, notify, injectDropout, pause, setConfig]);
   const startDemo = () => {
     const next = { ...DEFAULT_CONFIG, turbulence: 0, targets: 1, decoys: false };
     reset(next);
@@ -448,8 +386,7 @@ export default function MissionControl() {
     setDemoStage(0);
     setGuided(true);
     setTab('mission');
-    worker.current?.postMessage({ type: 'start' });
-    setRunning(true);
+    start();
   };
   const beginRecord = async () => {
     if (
@@ -1051,7 +988,7 @@ export default function MissionControl() {
                   <button
                     className="ghost small"
                     onClick={() => {
-                      worker.current?.postMessage({ type: 'dropout', seconds: 2.5 });
+                      injectDropout(2.5);
                       if (!running) start();
                       notify('A 2.5 second beacon dropout was injected.');
                     }}
